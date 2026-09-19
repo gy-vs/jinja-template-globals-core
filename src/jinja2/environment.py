@@ -5,6 +5,7 @@ import os
 import sys
 import typing as t
 import weakref
+from collections import ChainMap
 from functools import partial
 from functools import reduce
 
@@ -811,8 +812,15 @@ class Environment:
             if template is not None and (
                 not self.auto_reload or template.is_up_to_date
             ):
+                # template.globals is a ChainMap, modifying it will only
+                # affect the template, not the environment globals.
+                if globals:
+                    template.globals.update(globals)
+
                 return template
-        template = self.loader.load(self, name, globals)
+
+        template = self.loader.load(self, name, self.make_globals(globals))
+
         if self.cache is not None:
             self.cache[cache_key] = template
         return template
@@ -825,10 +833,16 @@ class Environment:
         to get the real template name before loading.
 
         The `globals` parameter can be used to provide template wide globals.
-        These variables are available in the context at render time.
+        These variables are available in the context at render time.  If the
+        template is already cached, its globals are updated with the new
+        values without affecting the environment's globals.
 
         If the template does not exist a :exc:`TemplateNotFound` exception is
         raised.
+
+        .. versionchanged:: 3.0
+           If a template is loaded from cache, `globals` will update the
+           template's globals instead of ignoring the new values.
 
         .. versionchanged:: 2.4
            If `name` is a :class:`Template` object it is returned from the
@@ -838,7 +852,7 @@ class Environment:
             return name
         if parent is not None:
             name = self.join_path(name, parent)
-        return self._load_template(name, self.make_globals(globals))
+        return self._load_template(name, globals)
 
     @internalcode
     def select_template(self, names, parent=None, globals=None):
@@ -864,7 +878,6 @@ class Environment:
             raise TemplatesNotFound(
                 message="Tried to select from an empty list of templates."
             )
-        globals = self.make_globals(globals)
         for name in names:
             if isinstance(name, Template):
                 return name
@@ -899,10 +912,22 @@ class Environment:
         return cls.from_code(self, self.compile(source), globals, None)
 
     def make_globals(self, d):
-        """Return a dict for the globals."""
-        if not d:
-            return self.globals
-        return dict(self.globals, **d)
+        """Make the globals map for a template. Any given template globals
+        overlay the environment globals.
+
+        Returns a :class:`collections.ChainMap`. This allows any changes to a
+        template's globals to only affect that template, while changes to the
+        environment's globals are still reflected.  However, avoid modifying
+        any globals after a template is loaded.
+
+        .. versionchanged:: 3.0
+           Use :class:`collections.ChainMap` to always prevent mutating
+           environment globals.
+        """
+        if d is None:
+            d = {}
+
+        return ChainMap(d, self.globals)
 
 
 class Template:

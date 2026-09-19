@@ -182,7 +182,9 @@ useful if you want to dig deeper into Jinja or :ref:`develop extensions
 
         The dict with the globals of that template.  It's unsafe to modify
         this dict as it may be shared with other templates or the environment
-        that loaded the template.
+        that loaded the template.  This is a :class:`collections.ChainMap`
+        of the globals passed when the template was loaded over
+        :attr:`Environment.globals`; updating it only affects this template.
 
     .. attribute:: name
 

@@ -111,6 +111,172 @@ class TestLoaders:
         mapping["foo"] = "two"
         assert env.get_template("foo").render() == "two"
 
+    def test_cached_template_globals_first_load(self):
+        env = Environment(loader=loaders.DictLoader({"foo": "{{ value }}"}))
+        tmpl = env.get_template("foo", globals={"value": "one"})
+        assert tmpl.render() == "one"
+        # cache hit, same object, globals are template specific
+        assert env.get_template("foo") is tmpl
+
+    def test_cached_template_globals_update(self):
+        env = Environment(loader=loaders.DictLoader({"foo": "{{ value }}"}))
+        tmpl = env.get_template("foo", globals={"value": "one"})
+        assert tmpl.render() == "one"
+        # loading again with new globals updates the cached template
+        assert env.get_template("foo", globals={"value": "two"}) is tmpl
+        assert tmpl.render() == "two"
+        # a later plain load keeps the previously merged globals
+        assert env.get_template("foo") is tmpl
+        assert tmpl.render() == "two"
+
+    def test_cached_template_globals_dont_pollute_environment(self):
+        env = Environment(
+            loader=loaders.DictLoader(
+                {"foo": "{{ value }}", "bar": "{{ value }}"}
+            )
+        )
+        env.globals["value"] = "env"
+        tmpl = env.get_template("foo", globals={"value": "one"})
+        assert tmpl.render() == "one"
+        assert env.get_template("foo", globals={"value": "two"}) is tmpl
+        assert tmpl.render() == "two"
+        assert env.globals["value"] == "env"
+        # other templates still see the environment global unchanged
+        other = env.get_template("bar")
+        assert other.render() == "env"
+        assert env.get_template("bar") is other
+
+    def test_cached_template_globals_caller_overrides(self):
+        env = Environment(loader=loaders.DictLoader({"foo": "{{ value }}"}))
+        env.globals["value"] = "env"
+        first = env.get_template("foo", globals={"value": "one"})
+        assert first.render() == "one"
+        # another caller overrides the same cached template
+        second = env.get_template("foo", globals={"value": "two"})
+        assert second is first
+        assert second.render() == "two"
+        assert first.render() == "two"
+        assert env.globals["value"] == "env"
+
+    @pytest.mark.parametrize("tag", ["include", "import"])
+    def test_cached_template_globals_include_import(self, tag):
+        if tag == "include":
+            main = "{% include 'base' %}"
+            base = "{{ value }}"
+        else:
+            main = "{% import 'base' as base %}{{ base.test() }}"
+            base = "{% macro test() %}{{ value }}{% endmacro %}"
+        env = Environment(
+            loader=loaders.DictLoader({"base": base, "main": main})
+        )
+        if tag == "include":
+            env.globals["value"] = "env"
+
+        # template globals passed to the caller are visible to the
+        # indirectly loaded base template on first load
+        tmpl = env.get_template("main", globals={"value": "one"})
+        assert tmpl.render() == "one"
+
+        # base was loaded indirectly, it only has environment globals
+        base_tmpl = env.get_template("base")
+        if tag == "include":
+            assert base_tmpl.render() == "env"
+
+        # setting template globals on base directly updates the cache;
+        # later renderings of base itself use the merged values
+        env.get_template("base", globals={"value": "two"})
+        if tag == "include":
+            assert base_tmpl.render() == "two"
+        assert env.get_template("base") is base_tmpl
+
+        # updating the cached caller's globals updates the template in
+        # place, without rebuilding it or touching env globals
+        assert env.get_template("main", globals={"value": "three"}) is tmpl
+        assert env.get_template("main") is tmpl
+        if tag == "include":
+            # includes re-render with the merged template globals
+            assert tmpl.render() == "three"
+        assert env.globals.get("value") == ("env" if tag == "include" else None)
+
+    def test_cached_template_globals_extends(self):
+        env = Environment(
+            loader=loaders.DictLoader(
+                {"base": "{{ value }}", "child": "{% extends 'base' %}"}
+            )
+        )
+        env.globals["value"] = "env"
+
+        child = env.get_template("child", globals={"value": "one"})
+        assert child.render() == "one"
+
+        base = env.get_template("base")
+        assert base.render() == "env"
+        env.get_template("base", globals={"value": "two"})
+        assert base.render() == "two"
+
+        assert env.get_template("child") is child
+        assert child.render() == "one"
+        assert env.globals["value"] == "env"
+
+    def test_cached_template_globals_select_template(self):
+        env = Environment(loader=loaders.DictLoader({"foo": "{{ value }}"}))
+        tmpl = env.select_template(
+            ["missing", "foo"], globals={"value": "one"}
+        )
+        assert tmpl.render() == "one"
+        assert (
+            env.select_template(["missing", "foo"], globals={"value": "two"})
+            is tmpl
+        )
+        assert tmpl.render() == "two"
+
+    def test_auto_reload_off_updates_cached_globals(self):
+        changed = False
+
+        class TestLoader(loaders.BaseLoader):
+            def get_source(self, environment, template):
+                return "{{ value }}", None, lambda: not changed
+
+        env = Environment(loader=TestLoader(), auto_reload=False)
+        tmpl = env.get_template("foo", globals={"value": "one"})
+        assert tmpl.render() == "one"
+        # even if the source were stale the cache is authoritative
+        changed = True
+        assert env.get_template("foo", globals={"value": "two"}) is tmpl
+        assert tmpl.render() == "two"
+
+    def test_auto_reload_on_updates_globals_without_source_change(self):
+        mapping = {"foo": "{{ value }}"}
+        env = Environment(
+            loader=loaders.DictLoader(mapping), auto_reload=True
+        )
+        tmpl = env.get_template("foo", globals={"value": "one"})
+        assert tmpl.render() == "one"
+        # up to date -> cache hit -> globals merged into cached template
+        assert env.get_template("foo", globals={"value": "two"}) is tmpl
+        assert tmpl.render() == "two"
+
+    def test_auto_reload_on_stale_template_reloads_with_globals(self):
+        state = {"source": "{{ value }}", "changed": False}
+
+        class TestLoader(loaders.BaseLoader):
+            def get_source(self, environment, template):
+                def uptodate():
+                    return not state["changed"]
+
+                return state["source"], None, uptodate
+
+        env = Environment(loader=TestLoader(), auto_reload=True)
+        tmpl = env.get_template("foo", globals={"value": "one"})
+        assert tmpl.render() == "one"
+        # source changes: the cache entry is reloaded, new globals apply
+        state["source"] = "{{ value }}!"
+        state["changed"] = True
+        reloaded = env.get_template("foo", globals={"value": "two"})
+        assert reloaded is not tmpl
+        assert reloaded.render() == "two!"
+        assert env.globals.get("value") is None
+
     def test_split_template_path(self):
         assert split_template_path("foo/bar") == ["foo", "bar"]
         assert split_template_path("./foo/bar") == ["foo", "bar"]

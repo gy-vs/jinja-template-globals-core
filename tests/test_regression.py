@@ -716,3 +716,35 @@ End"""
         # values set within a block or loop should not
         # show up outside of it
         assert tmpl.render() == "42\n0\n24\n0\n42\n1\n24\n1\n42"
+
+    @pytest.mark.parametrize("op", ["extends", "include"])
+    def test_cached_template_globals(self, op):
+        env = Environment(
+            loader=DictLoader(
+                {"base": "{{ x }} {{ y }}", "main": f"{{% {op} 'base' %}}"}
+            )
+        )
+        env.globals["x"] = "x"
+        env.globals["y"] = "y"
+
+        # template globals overlay env globals
+        tmpl = env.get_template("main", globals={"x": "bar"})
+        assert tmpl.render() == "bar y"
+
+        # base was loaded indirectly, it just has env globals
+        base = env.get_template("base")
+        assert base.render() == "x y"
+
+        # set template globals for base, no longer uses env globals
+        env.get_template("base", globals={"x": 42})
+        assert base.render() == "42 y"
+
+        # templates are cached, they keep template globals set earlier
+        assert env.get_template("main") is tmpl
+        assert tmpl.render() == "bar y"
+        assert env.get_template("base") is base
+        assert base.render() == "42 y"
+
+        # env globals were never mutated
+        assert env.globals["x"] == "x"
+        assert env.globals["y"] == "y"
