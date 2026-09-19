@@ -36,6 +36,11 @@ Unreleased
     being accessed in custom context functions. :issue:`768`
 -   Fix a bug that caused scoped blocks from accessing special loop
     variables. :issue:`1088`
+-   When a template is loaded from cache, globals passed to
+    :meth:`Environment.get_template` are now merged into the cached
+    template's globals instead of being ignored. Template globals are a
+    :class:`collections.ChainMap` over the environment globals, so
+    updating them never mutates :attr:`Environment.globals`.
 
 
 Version 2.11.3

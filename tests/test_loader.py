@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import weakref
+from collections import ChainMap
 
 import pytest
 
@@ -110,6 +111,147 @@ class TestLoaders:
         assert env.get_template("foo").render() == "one"
         mapping["foo"] = "two"
         assert env.get_template("foo").render() == "two"
+
+    def test_template_globals_first_load(self):
+        env = Environment(
+            loader=loaders.DictLoader({"foo": "{{ bar }}"}),
+        )
+        env.globals["bar"] = "env"
+        tmpl = env.get_template("foo", globals={"bar": "template"})
+        assert isinstance(tmpl.globals, ChainMap)
+        assert tmpl.render() == "template"
+        # environment globals are not mutated by template globals
+        assert env.globals["bar"] == "env"
+
+    @pytest.mark.parametrize("auto_reload", [True, False])
+    def test_cached_template_globals_update(self, auto_reload):
+        env = Environment(
+            auto_reload=auto_reload,
+            loader=loaders.DictLoader({"foo": "{{ bar }}"}),
+        )
+        tmpl = env.get_template("foo", globals={"bar": 1})
+        assert tmpl.render() == "1"
+
+        # a cache hit still merges the new globals into the cached object
+        for value in (2, 3):
+            cached = env.get_template("foo", globals={"bar": value})
+            assert cached is tmpl
+            assert cached.render() == str(value)
+
+        # merging template globals must never touch the environment globals
+        assert "bar" not in env.globals
+
+        # loading without globals is a plain cache hit and changes nothing
+        assert env.get_template("foo").render() == "3"
+        assert env.get_template("foo") is tmpl
+
+    def test_cached_template_globals_different_callers(self):
+        env = Environment(loader=loaders.DictLoader({"foo": "{{ bar }}"}))
+        first = env.get_template("foo", globals={"bar": "first"})
+        second = env.get_template("foo", globals={"bar": "second"})
+        # every name resolves to the one cached object, which reflects the
+        # globals of the most recent caller that passed any
+        assert first is second
+        assert first.render() == "second"
+        assert env.get_template("foo", globals={"bar": "third"}).render() == "third"
+        assert second.render() == "third"
+
+    @pytest.mark.parametrize("auto_reload", [True, False])
+    def test_cached_include_import_globals(self, auto_reload):
+        env = Environment(
+            auto_reload=auto_reload,
+            loader=loaders.DictLoader(
+                {
+                    "child": (
+                        "{% macro x() %}{{ bar }}{% endmacro %}{{ bar }}"
+                    ),
+                    "include_with": "{% include 'child' %}",
+                    "include_without": "{% include 'child' without context %}",
+                    "import": "{% from 'child' import x %}{{ x() }}",
+                }
+            ),
+        )
+        # "child" is loaded and cached indirectly through an include first,
+        # with no template globals of its own.
+        assert (
+            env.get_template(
+                "include_with", globals={"bar": "from parent"}
+            ).render()
+            == "from parent"
+        )
+
+        # updating the cached child's globals only affects the child
+        child = env.get_template("child", globals={"bar": "child"})
+        assert child.render() == "child"
+        # the include renders the child with the parent's context vars
+        assert (
+            env.get_template(
+                "include_with", globals={"bar": "from parent"}
+            ).render()
+            == "from parent"
+        )
+        # included without context and imported, the child uses its own
+        # cached globals
+        assert env.get_template("include_without").render() == "child"
+        assert env.get_template("import").render() == "child"
+        assert child.render() == "child"
+        assert "bar" not in env.globals
+
+    @pytest.mark.parametrize("op", ["extends", "include"])
+    def test_cached_extends_include_globals(self, op):
+        env = Environment(
+            loader=loaders.DictLoader(
+                {"base": "{{ x }} {{ y }}", "main": f"{{% {op} 'base' %}}"}
+            )
+        )
+        env.globals["x"] = "x"
+        env.globals["y"] = "y"
+
+        # template globals overlay environment globals
+        tmpl = env.get_template("main", globals={"x": "bar"})
+        assert tmpl.render() == "bar y"
+
+        # base was loaded indirectly, it only has environment globals
+        tmpl = env.get_template("base")
+        assert tmpl.render() == "x y"
+
+        # set template globals for the cached base, it no longer uses the
+        # environment value
+        tmpl = env.get_template("base", globals={"x": 42})
+        assert tmpl.render() == "42 y"
+
+        # cached templates keep the template globals set earlier
+        assert env.get_template("main").render() == "bar y"
+        assert env.get_template("base").render() == "42 y"
+
+    def test_cached_template_auto_reload_rebuilds_with_globals(self):
+        up_to_date = [True]
+
+        class TestLoader(loaders.BaseLoader):
+            def get_source(self, environment, template):
+                return "{{ bar }}", None, lambda: up_to_date[0]
+
+        env = Environment(auto_reload=True, loader=TestLoader())
+        tmpl = env.get_template("foo", globals={"bar": "old"})
+        assert tmpl.render() == "old"
+
+        # once the loader reports the template as out of date it is rebuilt,
+        # and the rebuild receives the current globals
+        up_to_date[0] = False
+        rebuilt = env.get_template("foo", globals={"bar": "new"})
+        assert rebuilt is not tmpl
+        assert rebuilt.render() == "new"
+        assert "bar" not in env.globals
+
+    def test_select_template_globals_update_cache(self):
+        env = Environment(
+            loader=loaders.DictLoader({"foo": "{{ bar }}"}),
+        )
+        tmpl = env.get_template("foo", globals={"bar": 1})
+        selected = env.select_template(["missing", "foo"], globals={"bar": 2})
+        assert selected is tmpl
+        assert selected.render() == "2"
+        assert "bar" not in env.globals
 
     def test_split_template_path(self):
         assert split_template_path("foo/bar") == ["foo", "bar"]
